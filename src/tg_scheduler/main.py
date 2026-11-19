@@ -6,21 +6,26 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from typing import Any
 
 from aiohttp import web
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
+from telethon.errors import RPCError
 from telethon.sessions import StringSession
 from telethon.tl.functions import PingRequest
+from telethon.tl.functions.channels import CreateChannelRequest
+from telethon.tl.types import Channel
 
-from tg_scheduler.config import Config
+from tg_scheduler.config import Config, RuntimeSettings, parse_timezone, tz_label
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("tg_scheduler")
+
+DEFAULT_CONTROL_TITLE = "TG Scheduler Control"
 
 
 @dataclass
@@ -33,13 +38,13 @@ class ScheduledJob:
     task: asyncio.Task[None] | None = None
 
 
-def parse_target_time(raw: str, tz: Any) -> datetime:
+def parse_target_time(raw: str, tz: tzinfo) -> datetime:
     """
     Accepts:
       - HH:MM
       - HH:MM:SS
       - HH:MM:SS.fff
-      - YYYY-MM-DD HH:MM:SS(.fff) (passed via ISO or space-joined)
+      - YYYY-MM-DDTHH:MM:SS(.fff) or YYYY-MM-DD_HH:MM:SS
     If only time is given and it already passed today, schedules for tomorrow.
     """
     now = datetime.now(tz)
@@ -79,18 +84,69 @@ async def measure_min_rtt(client: TelegramClient, samples: int = 3) -> float:
     return best
 
 
+def format_settings_message(settings: RuntimeSettings, control_id: int) -> str:
+    now_local = datetime.now(settings.tz)
+    return (
+        "🟢 **TG Scheduler Online**\n"
+        f"• Current time: `{now_local.strftime('%Y-%m-%d %H:%M:%S')}` "
+        f"(`{tz_label(settings.tz)}`)\n"
+        f"• Extra offset: `{settings.offset_ms:+.1f} ms`\n"
+        f"• Wake-up lead: `{settings.lead_sec:.1f} s`\n"
+        f"• Control chat ID: `{control_id}`\n\n"
+        "**Quick config:**\n"
+        "`/tz Europe/Minsk` (or `UTC+3`, `Europe/Moscow`)\n"
+        "`/offset <ms>` — fine-tune timing (e.g. `/offset -30`)\n"
+        "`/lead <sec>` — pre-warm lead time (default `3.0`)\n"
+        "`/help` — all commands"
+    )
+
+
+async def resolve_control_channel(client: TelegramClient, cfg: Config) -> Any:
+    """
+    Uses CONTROL_CHAT from env if provided; otherwise finds an existing
+    private 'TG Scheduler Control' channel owned by you, or creates one.
+    """
+    dialogs = await client.get_dialogs(limit=100)
+
+    if cfg.control_chat:
+        lookup: int | str = (
+            int(cfg.control_chat)
+            if cfg.control_chat.lstrip("-").isdigit()
+            else cfg.control_chat
+        )
+        return await client.get_entity(lookup)
+
+    for dialog in dialogs:
+        entity = dialog.entity
+        if (
+            isinstance(entity, Channel)
+            and entity.title == DEFAULT_CONTROL_TITLE
+            and entity.creator
+        ):
+            return entity
+
+    result = await client(
+        CreateChannelRequest(
+            title=DEFAULT_CONTROL_TITLE,
+            about="Command center for TG Scheduler userbot",
+            megagroup=False,
+        )
+    )
+    return result.chats[0]
+
+
 async def precision_send_job(
     client: TelegramClient,
     job: ScheduledJob,
     jobs: dict[str, ScheduledJob],
-    tz: Any,
+    settings: RuntimeSettings,
+    control_entity: Any,
 ) -> None:
+    tz = settings.tz
     try:
-        # 1. Sleep until 3 seconds before target time
-        lead_time = 3.0
-        now_ts = time.time()
+        # 1. Sleep until lead_sec before target time
         target_ts = job.target_dt.timestamp()
-        wake_up_delay = (target_ts - lead_time) - now_ts
+        wake_up_delay = (target_ts - settings.lead_sec) - time.time()
         if wake_up_delay > 0:
             await asyncio.sleep(wake_up_delay)
 
@@ -99,53 +155,49 @@ async def precision_send_job(
             await client.connect()
 
         rtt = await measure_min_rtt(client, samples=3)
-        one_way_delay = rtt / 2.0
+        one_way_delay = min(rtt / 2.0, 0.250)
+        fire_ts = target_ts - one_way_delay + (settings.offset_ms / 1000.0)
 
-        # Cap compensation at 250ms in case of an anomalous ping spike
-        one_way_delay = min(one_way_delay, 0.250)
-        fire_ts = target_ts - one_way_delay
-
-        # 3. Coarse async sleep until 15ms before fire_ts
+        # 3. Async sleep until ~2ms before fire_ts, then spin for sub-ms precision
         remaining = fire_ts - time.time()
-        if remaining > 0.015:
-            await asyncio.sleep(remaining - 0.015)
+        if remaining > 0.002:
+            await asyncio.sleep(remaining - 0.002)
 
-        # 4. Fine sleep (yield to event loop cleanly in small steps until exact fire_ts)
-        while time.time() < fire_ts:
-            if fire_ts - time.time() > 0.002:
-                await asyncio.sleep(0.001)
-            else:
-                # Final <2ms spin for sub-millisecond OS scheduler precision
-                pass
+        deadline = time.perf_counter() + max(0.0, fire_ts - time.time())
+        while time.perf_counter() < deadline:
+            pass
 
         fired_local = datetime.now(tz)
         sent = await client.send_message(job.target_peer, job.message)
         ack_local = datetime.now(tz)
 
         server_time = sent.date.astimezone(tz)
-        await client.send_message(
-            "me",
-            (
-                f"✅ **Sent** (`{job.job_id}`)\n"
-                f"• Target: `{job.target_dt.strftime('%H:%M:%S.%f')[:-3]}`\n"
-                f"• One-way RTT comp: `{one_way_delay * 1000:.1f} ms`\n"
-                f"• Fired locally: `{fired_local.strftime('%H:%M:%S.%f')[:-3]}`\n"
-                f"• Ack received: `{ack_local.strftime('%H:%M:%S.%f')[:-3]}`\n"
-                f"• Telegram server timestamp: `{server_time.strftime('%H:%M:%S')}`"
-            ),
+        report = (
+            f"✅ **Sent** (`{job.job_id}` → `{job.target_label}`)\n"
+            f"• Target ({tz_label(tz)}): `{job.target_dt.strftime('%H:%M:%S.%f')[:-3]}`\n"
+            f"• One-way RTT comp: `{one_way_delay * 1000:.1f} ms` "
+            f"(offset `{settings.offset_ms:+.1f} ms`)\n"
+            f"• Fired locally: `{fired_local.strftime('%H:%M:%S.%f')[:-3]}`\n"
+            f"• Ack received: `{ack_local.strftime('%H:%M:%S.%f')[:-3]}`\n"
+            f"• Telegram server timestamp: `{server_time.strftime('%H:%M:%S')}`"
         )
+        await client.send_message(control_entity, report)
     except asyncio.CancelledError:
         logger.info("Job %s cancelled.", job.job_id)
         raise
     except Exception as exc:
         logger.exception("Failed job %s", job.job_id)
-        await client.send_message("me", f"❌ Job `{job.job_id}` failed: `{exc}`")
+        await client.send_message(control_entity, f"❌ Job `{job.job_id}` failed: `{exc}`")
     finally:
         jobs.pop(job.job_id, None)
 
 
-async def start_http_server(port: int, client: TelegramClient, jobs: dict[str, ScheduledJob]) -> None:
-    """Lightweight HTTP server required by Render Web Services & external keep-alive pingers."""
+async def start_http_server(
+    port: int,
+    client: TelegramClient,
+    jobs: dict[str, ScheduledJob],
+) -> None:
+    """Lightweight HTTP server for Render Web Services & external keep-alive pingers."""
 
     async def health(_request: web.Request) -> web.Response:
         status = {
@@ -168,6 +220,7 @@ async def start_http_server(port: int, client: TelegramClient, jobs: dict[str, S
 
 async def async_main() -> None:
     cfg = Config.from_env()
+    settings = RuntimeSettings.load(cfg)
     jobs: dict[str, ScheduledJob] = {}
 
     client = TelegramClient(
@@ -179,8 +232,17 @@ async def async_main() -> None:
     me = await client.get_me()
     logger.info("Logged in as %s (id=%s)", me.username or me.first_name, me.id)
 
-    @client.on(events.NewMessage(chats="me", outgoing=True))
-    async def on_saved_message(event: events.NewMessage.Event) -> None:
+    control_entity = await resolve_control_channel(client, cfg)
+    control_peer_id = utils.get_peer_id(control_entity)
+    logger.info("Using control chat: %s (id=%s)", DEFAULT_CONTROL_TITLE, control_peer_id)
+
+    await client.send_message(
+        control_entity,
+        format_settings_message(settings, control_peer_id),
+    )
+
+    @client.on(events.NewMessage(chats=[control_peer_id]))
+    async def on_control_message(event: events.NewMessage.Event) -> None:
         text = (event.raw_text or "").strip()
         if not text.startswith("/"):
             return
@@ -193,52 +255,162 @@ async def async_main() -> None:
                 "**Commands:**\n"
                 "`/send <@user_or_id> <HH:MM[:SS[.mmm]]> <message>`\n"
                 "`/list` — show pending jobs\n"
-                "`/cancel <id>` — cancel a job"
+                "`/cancel [id]` — cancel job (or last scheduled if no ID)\n"
+                "`/clear [count]` — delete chat history (or last N messages)\n"
+                "`/settings` — show current settings & clock\n"
+                "`/tz <zone>` — set timezone (e.g. `Europe/Minsk`, `UTC+3`)\n"
+                "`/offset <ms>` — set timing offset in ms\n"
+                "`/lead <sec>` — set pre-warm lead time in seconds"
             )
+            return
+
+        if cmd == "/settings":
+            await event.reply(format_settings_message(settings, control_peer_id))
+            return
+
+        if cmd == "/tz":
+            if len(parts) < 2:
+                now_local = datetime.now(settings.tz)
+                await event.reply(
+                    f"Current timezone: `{tz_label(settings.tz)}` "
+                    f"(`{now_local.strftime('%H:%M:%S')}`)\n"
+                    "Usage: `/tz Europe/Minsk` or `/tz UTC+3`"
+                )
+                return
+            raw_tz = text.split(maxsplit=1)[1].strip()
+            try:
+                new_tz = parse_timezone(raw_tz)
+            except ValueError as err:
+                await event.reply(f"❌ {err}")
+                return
+            settings.timezone_str = raw_tz
+            settings.tz = new_tz
+            settings.save()
+            now_local = datetime.now(settings.tz)
+            await event.reply(
+                f"✅ Timezone set to `{tz_label(settings.tz)}`. "
+                f"Current time: `{now_local.strftime('%Y-%m-%d %H:%M:%S')}`"
+            )
+            return
+
+        if cmd == "/offset":
+            if len(parts) < 2:
+                await event.reply(f"Current offset: `{settings.offset_ms:+.1f} ms`")
+                return
+            try:
+                val = float(parts[1])
+            except ValueError:
+                await event.reply("❌ Usage: `/offset <ms>` (e.g. `/offset -25`)")
+                return
+            settings.offset_ms = val
+            settings.save()
+            await event.reply(f"✅ Extra timing offset set to `{val:+.1f} ms`.")
+            return
+
+        if cmd == "/lead":
+            if len(parts) < 2:
+                await event.reply(f"Current lead time: `{settings.lead_sec:.1f} s`")
+                return
+            try:
+                val = float(parts[1])
+                if not (0.5 <= val <= 30.0):
+                    raise ValueError
+            except ValueError:
+                await event.reply("❌ Usage: `/lead <seconds>` (between `0.5` and `30.0`)")
+                return
+            settings.lead_sec = val
+            settings.save()
+            await event.reply(f"✅ Wake-up lead time set to `{val:.1f} s`.")
             return
 
         if cmd == "/list":
             if not jobs:
                 await event.reply("No pending jobs.")
                 return
-            lines = [
-                f"• `{j.job_id}` → `{j.target_label}` at `{j.target_dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}`"
-                for j in jobs.values()
-            ]
+            lines = []
+            for job in jobs.values():
+                ts_str = job.target_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                lines.append(
+                    f"• `{job.job_id}` → `{job.target_label}` at `{ts_str}`"
+                )
             await event.reply("**Pending jobs:**\n" + "\n".join(lines))
             return
 
         if cmd == "/cancel":
-            if len(parts) < 2:
-                await event.reply("Usage: `/cancel <id>`")
+            if not jobs:
+                await event.reply("No pending jobs to cancel.")
                 return
-            job_id = parts[1].strip()
+            job_id = parts[1].strip() if len(parts) >= 2 else next(reversed(jobs))
             job = jobs.get(job_id)
             if not job or not job.task:
                 await event.reply(f"Job `{job_id}` not found.")
                 return
             job.task.cancel()
-            await event.reply(f"🛑 Cancelled job `{job_id}`.")
+            await event.reply(
+                f"🛑 Cancelled `{job_id}` (`{job.target_label}` at "
+                f"`{job.target_dt.strftime('%H:%M:%S')}`)."
+            )
+            return
+
+        if cmd == "/clear":
+            count_limit: int | None = None
+            if len(parts) >= 2:
+                try:
+                    count_limit = int(parts[1])
+                    if count_limit <= 0:
+                        raise ValueError
+                except ValueError:
+                    await event.reply("❌ Usage: `/clear` or `/clear <count>`")
+                    return
+
+            ids: list[int] = []
+            fetch_limit = (count_limit + 1) if count_limit is not None else 500
+            async for msg in client.iter_messages(control_entity, limit=fetch_limit):
+                if msg.id == 1 and getattr(msg, "action", None) is not None:
+                    continue
+                ids.append(msg.id)
+
+            deleted = 0
+            for i in range(0, len(ids), 100):
+                chunk = ids[i : i + 100]
+                try:
+                    await client.delete_messages(control_entity, chunk)
+                    deleted += len(chunk)
+                except RPCError as err:
+                    logger.warning("Failed deleting some messages: %s", err)
+
+            notice = await client.send_message(
+                control_entity,
+                f"🧹 Cleared {deleted} message(s).",
+            )
+            await asyncio.sleep(3)
+            try:
+                await notice.delete()
+            except RPCError:
+                pass
             return
 
         if cmd == "/send":
             if len(parts) < 4:
-                await event.reply("Usage: `/send <@user_or_id> <HH:MM[:SS[.mmm]]> <message>`")
+                await event.reply(
+                    "Usage: `/send <@user_or_id> <HH:MM[:SS[.mmm]]> <message>`"
+                )
                 return
 
             target_raw, time_raw, msg_body = parts[1], parts[2], parts[3]
 
             try:
-                target_dt = parse_target_time(time_raw, cfg.timezone)
+                target_dt = parse_target_time(time_raw, settings.tz)
             except ValueError as err:
                 await event.reply(f"❌ {err}")
                 return
 
-            # Pre-resolve entity now so there is zero lookup overhead at fire time
             try:
-                target_lookup: int | str = int(target_raw) if target_raw.lstrip("-").isdigit() else target_raw
+                target_lookup: int | str = (
+                    int(target_raw) if target_raw.lstrip("-").isdigit() else target_raw
+                )
                 peer = await client.get_input_entity(target_lookup)
-            except Exception as err:
+            except (ValueError, RPCError, OSError) as err:
                 await event.reply(f"❌ Could not resolve chat `{target_raw}`: `{err}`")
                 return
 
@@ -250,11 +422,14 @@ async def async_main() -> None:
                 message=msg_body,
                 target_dt=target_dt,
             )
-            job.task = asyncio.create_task(precision_send_job(client, job, jobs, cfg.timezone))
+            job.task = asyncio.create_task(
+                precision_send_job(client, job, jobs, settings, control_entity)
+            )
             jobs[job_id] = job
 
+            ts_str = target_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             await event.reply(
-                f"⏱️ Scheduled `{job_id}` for `{target_dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} {cfg.timezone.key}`"
+                f"⏱️ Scheduled `{job_id}` for `{ts_str} {tz_label(settings.tz)}`"
             )
 
     await start_http_server(cfg.port, client, jobs)

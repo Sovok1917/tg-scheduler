@@ -3,11 +3,13 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 
+
 .env
 .env.*
 !.env.example
 *.session
 *.session-journal
+settings.json
 
 .vscode/
 .idea/

@@ -1,27 +1,31 @@
 [project]
 name = "tg-scheduler"
 version = "0.1.0"
-description = "Add your description here"
+description = "Precision Telegram userbot message scheduler"
 readme = "README.md"
-authors = [
-    { name = "Sovok1917", email = "mushroomcommunist@gmail.com" }
-]
 requires-python = ">=3.13"
 dependencies = [
-    "aiohttp>=3.14.5",
-    "cryptg>=0.6.1",
-    "python-dotenv>=1.2.4",
+    "aiohttp>=3.10.0",
+    "cryptg>=0.4.0",
+    "python-dotenv>=1.0.1",
     "telethon>=1.46.0",
 ]
 
 [project.scripts]
-tg-scheduler = "tg_scheduler:main"
+tg-scheduler = "tg_scheduler.main:run"
 
 [build-system]
-requires = ["uv_build>=0.13.9,<0.14.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "ruff>=0.17.5",
+    "ruff>=0.7.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "BLE", "ASYNC"]
