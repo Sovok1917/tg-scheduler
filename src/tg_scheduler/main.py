@@ -15,7 +15,7 @@ from telethon.errors import RPCError
 from telethon.sessions import StringSession
 from telethon.tl.functions import PingRequest
 from telethon.tl.functions.channels import CreateChannelRequest
-from telethon.tl.types import Channel
+from telethon.tl.types import Channel, PeerChannel, PeerChat
 
 from tg_scheduler.config import Config, RuntimeSettings, parse_timezone, tz_label
 
@@ -97,6 +97,7 @@ def format_settings_message(settings: RuntimeSettings, control_id: int) -> str:
         "`/tz Europe/Minsk` (or `UTC+3`, `Europe/Moscow`)\n"
         "`/offset <ms>` — fine-tune timing (e.g. `/offset -30`)\n"
         "`/lead <sec>` — pre-warm lead time (default `3.0`)\n"
+        "`/chats [filter]` — list chat IDs\n"
         "`/help` — all commands"
     )
 
@@ -133,6 +134,32 @@ async def resolve_control_channel(client: TelegramClient, cfg: Config) -> Any:
         )
     )
     return result.chats[0]
+
+
+async def resolve_target_peer(client: TelegramClient, target_raw: str) -> Any:
+    """
+    Resolves @usernames, marked IDs (-100...), or raw positive IDs copied
+    from Telegram Desktop's 'Show Peer IDs in Profile' (e.g. 2202296046).
+    """
+    if not target_raw.lstrip("-").isdigit():
+        return await client.get_input_entity(target_raw)
+
+    raw_num = int(target_raw)
+    candidates: list[Any] = [raw_num]
+    if raw_num > 0:
+        candidates.extend([PeerChannel(raw_num), PeerChat(raw_num)])
+
+    for attempt in range(2):
+        for candidate in candidates:
+            try:
+                return await client.get_input_entity(candidate)
+            except ValueError:
+                continue
+        if attempt == 0:
+            # Refresh full dialog cache in case the group is older/archived
+            await client.get_dialogs(limit=300)
+
+    raise ValueError(f"Cannot find any user, group, or channel with ID '{target_raw}'.")
 
 
 async def precision_send_job(
@@ -254,6 +281,7 @@ async def async_main() -> None:
             await event.reply(
                 "**Commands:**\n"
                 "`/send <@user_or_id> <HH:MM[:SS[.mmm]]> <message>`\n"
+                "`/chats [filter]` — list your chat IDs\n"
                 "`/list` — show pending jobs\n"
                 "`/cancel [id]` — cancel job (or last scheduled if no ID)\n"
                 "`/clear [count]` — delete chat history (or last N messages)\n"
@@ -262,6 +290,25 @@ async def async_main() -> None:
                 "`/offset <ms>` — set timing offset in ms\n"
                 "`/lead <sec>` — set pre-warm lead time in seconds"
             )
+            return
+
+        if cmd == "/chats":
+            query = text.split(maxsplit=1)[1].strip().lower() if len(parts) >= 2 else ""
+            dialogs = await client.get_dialogs(limit=100)
+            lines = []
+            for dialog in dialogs:
+                name = dialog.name or "(unnamed)"
+                if query and query not in name.lower():
+                    continue
+                username = getattr(dialog.entity, "username", None)
+                u_str = f" (@{username})" if username else ""
+                lines.append(f"• `{dialog.id}` — {name}{u_str}")
+                if len(lines) >= 25:
+                    break
+            if not lines:
+                await event.reply("No matching chats found.")
+            else:
+                await event.reply("**Chats (use the ID with `/send`):**\n" + "\n".join(lines))
             return
 
         if cmd == "/settings":
@@ -406,10 +453,7 @@ async def async_main() -> None:
                 return
 
             try:
-                target_lookup: int | str = (
-                    int(target_raw) if target_raw.lstrip("-").isdigit() else target_raw
-                )
-                peer = await client.get_input_entity(target_lookup)
+                peer = await resolve_target_peer(client, target_raw)
             except (ValueError, RPCError, OSError) as err:
                 await event.reply(f"❌ Could not resolve chat `{target_raw}`: `{err}`")
                 return
